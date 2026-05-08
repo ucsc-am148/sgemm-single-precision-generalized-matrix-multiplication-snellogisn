@@ -107,27 +107,35 @@ def sgemm_smem(A, B, C, M, N, K):
     As = cuda.shared.array((BM3, BK3), float32)
     Bs = cuda.shared.array((BK3, BN3), float32)
 
-    # Identify where we are locally and globally
-    local_row, local_col = cuda.threadIdx.x // BK3, cuda.threadIdx.x % BK3
-    row, col = cuda.blockIdx.x * BK3 + local_row, cuda.blockIdx.y * BK3 + local_col
-    
+    local_row = cuda.threadIdx.x // BN3
+    local_col = cuda.threadIdx.x %  BN3
+
+    row = cuda.blockIdx.x * BM3 + local_row
+    col = cuda.blockIdx.y * BN3 + local_col
+
     tmp = float32(0.0)
-    for i in range(0, K, BK3):
-        if row < M and (i + local_col) < K:
-            As[local_row, local_col] = A[row, i + local_col]
+    for kt in range(0, K, BK3):
+        # Load As[local_row, local_col] = A[row, kt + local_col]
+        if row < M and (kt + local_col) < K:
+            As[local_row, local_col] = A[row, kt + local_col]
         else:
             As[local_row, local_col] = float32(0.0)
-        
-        if (i + local_row) < K and col < N:
-            Bs[local_row, local_col] = B[i + local_row, col]
+
+        # Load Bs[local_row, local_col] = B[kt + local_row, col]
+        if (kt + local_row) < K and col < N:
+            Bs[local_row, local_col] = B[kt + local_row, col]
         else:
             Bs[local_row, local_col] = float32(0.0)
+
         cuda.syncthreads()
 
         for j in range(BK3):
             tmp += As[local_row, j] * Bs[j, local_col]
+
         cuda.syncthreads()
-    C[row, col] = tmp
+
+    if row < M and col < N:
+        C[row, col] = tmp
     return
 
 
