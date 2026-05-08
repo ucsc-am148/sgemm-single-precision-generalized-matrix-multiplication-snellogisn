@@ -53,7 +53,7 @@ def sgemm_naive(A, B, C, M, N, K):
         for i in range(K):
             tmp += A[x, i] * B[i, y]
         C[x, y] = tmp
-
+    return
 
 # ── K2: GMEM coalescing (TODO) ──────────────────────────────────────
 
@@ -72,9 +72,15 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # TODO
+    # Identify which row and column we are at
+    x = cuda.blockIdx.x * BLOCKSIZE + cuda.threadIdx.x // BLOCKSIZE
+    y = cuda.blockIdx.y * BLOCKSIZE + cuda.threadIdx.x % BLOCKSIZE
+    if x < M and y < N:
+        tmp = float32(0.0)
+        for i in range(K):
+            tmp += A[x, i] * B[i, y]
+        C[x, y] = tmp
     return
-
 
 # ── K3: shared-memory cache-blocking (TODO) ─────────────────────────
 
@@ -97,7 +103,24 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
+    # Somewhere to store the current blocks
+    As = cuda.shared.array((BM3, BK3), float32)
+    Bs = cuda.shared.array((BK3, BN3), float32)
+
+    # Identify where we are locally and globally
+    local_row, local_col = cuda.threadIdx.x // BK3, cuda.threadIdx.x % BK3
+    row, col = cuda.blockIdx.x * BK3 + local_row, cuda.blockIdx.y * BK3 + local_col
+    
+    tmp = float32(0.0)
+    for i in range(0, K, BK3):
+        As[local_row, local_col] = A[row, i + local_col]
+        Bs[local_row, local_col] = B[i + local_row, col]
+        cuda.syncthreads()
+
+        for j in range(BK3):
+            tmp += As[local_row, j] * Bs[j, local_col]
+        cuda.syncthreads()
+    C[row, col] = tmp
     return
 
 
@@ -123,8 +146,37 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
-    return
+    # Somewhere to store the current blocks
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+
+    # Identify which row and column we are at
+    block_row, block_col = cuda.blockIdx.y, cuda.blockIdx.x
+    local_row, local_col = cuda.threadIdx.x // BN4, cuda.threadIdx.x % BN4
+
+    a_row, a_col = cuda.threadIdx.x // BK4, cuda.threadIdx.x % BK4
+    b_row, b_col = cuda.threadIdx.x // BN4, cuda.threadIdx.x % BN4
+
+    c_row, c_col = block_row * BM4, block_col * BN4
+    
+    tmp = cuda.local.array(TM4, float32)
+    for i in range(TM4):
+        tmp[i] = float32(0.0)
+
+    for i in range(0, K, BK4):
+        As[a_row, a_col] = A[c_row + a_row, i + a_col]
+        Bs[b_row, b_col] = B[i + b_row, c_col + b_col]
+        cuda.syncthreads()
+
+        for j in range(BK4):
+            b_tmp = Bs[j, local_col]
+            for k in range(TM4):
+                tmp[k] += As[local_row * TM4 + k, j] * b_tmp
+        cuda.syncthreads()
+    
+    for k in range(TM4):
+        C[c_row + local_row * TM4 + k, c_col + local_col] = tmp[k]
+
 
 
 # ── K5: 2D register tiling (TODO) ───────────────────────────────────
@@ -148,7 +200,65 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
+    # Shared memory tiles
+    As = cuda.shared.array((BM5, BK5), float32)  
+    Bs = cuda.shared.array((BK5, BN5), float32) 
+    tx = cuda.threadIdx.x                         
+    block_row, block_col = cuda.blockIdx.y, cuda.blockIdx.x
+
+    threads_per_row = BN5 // TN5                  
+    local_row = tx // threads_per_row            
+    local_col = tx %  threads_per_row           
+
+    a_row = tx // BK5                              
+    a_col = tx %  BK5                             
+    stride_a = (BM5 * BN5 // (TM5 * TN5)) // BK5   
+
+    b_row = tx // BN5                              
+    b_col = tx %  BN5                              
+    stride_b = (BM5 * BN5 // (TM5 * TN5)) // BN5   
+
+    # Origins of this block's output tile
+    c_row = block_row * BM5
+    c_col = block_col * BN5
+
+    # Per-thread 8x8 register tile
+    tmp = cuda.local.array((TM5, TN5), float32)
+    for i in range(TM5):
+        for j in range(TN5):
+            tmp[i, j] = float32(0.0)
+
+    # Register caches for the inner outer-product
+    reg_a = cuda.local.array(TM5, float32)
+    reg_b = cuda.local.array(TN5, float32)
+
+    # Outer K-loop over tiles
+    for kt in range(0, K, BK5):
+        for offset in range(0, BM5, stride_a):
+            As[a_row + offset, a_col] = A[c_row + a_row + offset, kt + a_col]
+
+        for offset in range(0, BK5, stride_b):
+            Bs[b_row + offset, b_col] = B[kt + b_row + offset, c_col + b_col]
+
+        cuda.syncthreads()
+
+        for dot_idx in range(BK5):
+
+            for i in range(TM5):
+                reg_a[i] = As[local_row * TM5 + i, dot_idx]
+            for j in range(TN5):
+                reg_b[j] = Bs[dot_idx, local_col * TN5 + j]
+
+
+            for i in range(TM5):
+                for j in range(TN5):
+                    tmp[i, j] += reg_a[i] * reg_b[j]
+        cuda.syncthreads()
+
+    for i in range(TM5):
+        for j in range(TN5):
+            C[c_row + local_row * TM5 + i, c_col + local_col * TN5 + j] = tmp[i, j]
+
     return
 
 
