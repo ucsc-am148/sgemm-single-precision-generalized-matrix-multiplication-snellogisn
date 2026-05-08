@@ -113,8 +113,15 @@ def sgemm_smem(A, B, C, M, N, K):
     
     tmp = float32(0.0)
     for i in range(0, K, BK3):
-        As[local_row, local_col] = A[row, i + local_col]
-        Bs[local_row, local_col] = B[i + local_row, col]
+        if row < M and (i + local_col) < K:
+            As[local_row, local_col] = A[row, i + local_col]
+        else:
+            As[local_row, local_col] = float32(0.0)
+        
+        if (i + local_row) < K and col < N:
+            Bs[local_row, local_col] = B[i + local_row, col]
+        else:
+            Bs[local_row, local_col] = float32(0.0)
         cuda.syncthreads()
 
         for j in range(BK3):
@@ -164,8 +171,21 @@ def sgemm_1d_tile(A, B, C, M, N, K):
         tmp[i] = float32(0.0)
 
     for i in range(0, K, BK4):
-        As[a_row, a_col] = A[c_row + a_row, i + a_col]
-        Bs[b_row, b_col] = B[i + b_row, c_col + b_col]
+
+        gA_r = c_row + a_row
+        gA_c = i + a_col
+        if gA_r < M and gA_c < K:
+            As[a_row, a_col] = A[gA_r, gA_c]
+        else:
+            As[a_row, a_col] = float32(0.0)
+
+        gB_r = i + b_row
+        gB_c = c_col + b_col
+        if gB_r < K and gB_c < N:
+            Bs[b_row, b_col] = B[gB_r, gB_c]
+        else:
+            Bs[b_row, b_col] = float32(0.0)
+
         cuda.syncthreads()
 
         for j in range(BK4):
@@ -175,7 +195,11 @@ def sgemm_1d_tile(A, B, C, M, N, K):
         cuda.syncthreads()
     
     for k in range(TM4):
-        C[c_row + local_row * TM4 + k, c_col + local_col] = tmp[k]
+        gr = c_row + local_row * TM4 + k
+        gc = c_col + local_col
+        if gr < M and gc < N:
+            C[gr, gc] = tmp[k]
+    return
 
 
 
@@ -200,23 +224,23 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # Shared memory tiles
-    As = cuda.shared.array((BM5, BK5), float32)  
-    Bs = cuda.shared.array((BK5, BN5), float32) 
-    tx = cuda.threadIdx.x                         
+# Shared memory tiles
+    As = cuda.shared.array((BM5, BK5), float32)
+    Bs = cuda.shared.array((BK5, BN5), float32)
+    tx = cuda.threadIdx.x
     block_row, block_col = cuda.blockIdx.y, cuda.blockIdx.x
 
-    threads_per_row = BN5 // TN5                  
-    local_row = tx // threads_per_row            
-    local_col = tx %  threads_per_row           
+    threads_per_row = BN5 // TN5
+    local_row = tx // threads_per_row
+    local_col = tx %  threads_per_row
 
-    a_row = tx // BK5                              
-    a_col = tx %  BK5                             
-    stride_a = (BM5 * BN5 // (TM5 * TN5)) // BK5   
+    a_row = tx // BK5
+    a_col = tx %  BK5
+    stride_a = (BM5 * BN5 // (TM5 * TN5)) // BK5
 
-    b_row = tx // BN5                              
-    b_col = tx %  BN5                              
-    stride_b = (BM5 * BN5 // (TM5 * TN5)) // BN5   
+    b_row = tx // BN5
+    b_col = tx %  BN5
+    stride_b = (BM5 * BN5 // (TM5 * TN5)) // BN5
 
     # Origins of this block's output tile
     c_row = block_row * BM5
@@ -234,30 +258,45 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
     # Outer K-loop over tiles
     for kt in range(0, K, BK5):
+        # Cooperative load of As with bounds check
         for offset in range(0, BM5, stride_a):
-            As[a_row + offset, a_col] = A[c_row + a_row + offset, kt + a_col]
+            gA_r = c_row + a_row + offset
+            gA_c = kt + a_col
+            if gA_r < M and gA_c < K:
+                As[a_row + offset, a_col] = A[gA_r, gA_c]
+            else:
+                As[a_row + offset, a_col] = float32(0.0)
 
+        # Cooperative load of Bs with bounds check
         for offset in range(0, BK5, stride_b):
-            Bs[b_row + offset, b_col] = B[kt + b_row + offset, c_col + b_col]
+            gB_r = kt + b_row + offset
+            gB_c = c_col + b_col
+            if gB_r < K and gB_c < N:
+                Bs[b_row + offset, b_col] = B[gB_r, gB_c]
+            else:
+                Bs[b_row + offset, b_col] = float32(0.0)
 
         cuda.syncthreads()
 
         for dot_idx in range(BK5):
-
             for i in range(TM5):
                 reg_a[i] = As[local_row * TM5 + i, dot_idx]
             for j in range(TN5):
                 reg_b[j] = Bs[dot_idx, local_col * TN5 + j]
 
-
             for i in range(TM5):
                 for j in range(TN5):
                     tmp[i, j] += reg_a[i] * reg_b[j]
+
         cuda.syncthreads()
 
+    # Writeback with bounds check
     for i in range(TM5):
         for j in range(TN5):
-            C[c_row + local_row * TM5 + i, c_col + local_col * TN5 + j] = tmp[i, j]
+            gr = c_row + local_row * TM5 + i
+            gc = c_col + local_col * TN5 + j
+            if gr < M and gc < N:
+                C[gr, gc] = tmp[i, j]
 
     return
 
